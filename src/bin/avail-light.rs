@@ -1,6 +1,5 @@
 #![doc = include_str!("../../README.md")]
 
-use anyhow::{anyhow, Context, Result};
 use avail_core::AppId;
 use avail_light::types::IdentityConfig;
 use avail_light::{api, data, network::rpc, telemetry};
@@ -10,6 +9,10 @@ use avail_light::{
 	types::{CliOpts, Mode, RuntimeConfig, State},
 };
 use clap::Parser;
+use color_eyre::{
+	eyre::{eyre, WrapErr},
+	Report, Result,
+};
 use kate_recovery::com::AppData;
 use libp2p::{multiaddr::Protocol, Multiaddr};
 use std::{
@@ -70,7 +73,7 @@ fn parse_log_level(log_level: &str, default: Level) -> (Level, Option<ParseLevel
 		.unwrap_or_else(|parse_err| (default, Some(parse_err)))
 }
 
-async fn run(error_sender: Sender<anyhow::Error>) -> Result<()> {
+async fn run(error_sender: Sender<Report>) -> Result<()> {
 	let opts = CliOpts::parse();
 
 	let mut cfg: RuntimeConfig = RuntimeConfig::default();
@@ -100,14 +103,14 @@ async fn run(error_sender: Sender<anyhow::Error>) -> Result<()> {
 
 	if opts.clean && Path::new(&cfg.avail_path).exists() {
 		info!("Cleaning up local state directory");
-		fs::remove_dir_all(&cfg.avail_path).context("Failed to remove local state directory")?;
+		fs::remove_dir_all(&cfg.avail_path).wrap_err("Failed to remove local state directory")?;
 	}
 
 	if cfg.bootstraps.is_empty() {
-		Err(anyhow!("Bootstrap node list must not be empty. Either use a '--network' flag or add a list of bootstrap nodes in the configuration file"))?
+		Err(eyre!("Bootstrap node list must not be empty. Either use a '--network' flag or add a list of bootstrap nodes in the configuration file"))?
 	}
 
-	let db = data::init_db(&cfg.avail_path).context("Cannot initialize database")?;
+	let db = data::init_db(&cfg.avail_path).wrap_err("Cannot initialize database")?;
 
 	// If in fat client mode, enable deleting local Kademlia records
 	// This is a fat client memory optimization
@@ -128,7 +131,7 @@ async fn run(error_sender: Sender<anyhow::Error>) -> Result<()> {
 			#[cfg(feature = "crawl")]
 			cfg.crawl.crawl_block_delay,
 		)
-		.context("Unable to initialize OpenTelemetry service")?,
+		.wrap_err("Unable to initialize OpenTelemetry service")?,
 	);
 
 	// raise new P2P Network Client and Event Loop
@@ -140,7 +143,7 @@ async fn run(error_sender: Sender<anyhow::Error>) -> Result<()> {
 		kad_remove_local_record,
 		id_keys,
 	)
-	.context("Failed to init Network Service")?;
+	.wrap_err("Failed to init Network Service")?;
 
 	// spawn the P2P Network task for Event Loop run in the background
 	tokio::spawn(p2p_event_loop.run());
@@ -157,7 +160,7 @@ async fn run(error_sender: Sender<anyhow::Error>) -> Result<()> {
 				.with(Protocol::QuicV1),
 		)
 		.await
-		.context("Listening on UDP not to fail.")?;
+		.wrap_err("Listening on UDP not to fail.")?;
 	info!("Listening for QUIC on port: {port}");
 
 	p2p_client
@@ -167,7 +170,7 @@ async fn run(error_sender: Sender<anyhow::Error>) -> Result<()> {
 				.with(Protocol::Tcp(port + 1)),
 		)
 		.await
-		.context("Listening on TCP not to fail.")?;
+		.wrap_err("Listening on TCP not to fail.")?;
 	info!("Listening for TCP on port: {port}");
 
 	// wait here for bootstrap to finish
@@ -304,7 +307,7 @@ async fn run(error_sender: Sender<anyhow::Error>) -> Result<()> {
 	} else {
 		let mut s = state
 			.lock()
-			.map_err(|e| anyhow!("State mutex is poisoned: {e:#}"))?;
+			.map_err(|e| eyre!("State mutex is poisoned: {e:#}"))?;
 		warn!("Finality sync is disabled! Implicitly, blocks before LC startup will be considered verified as final");
 		s.finality_synced = true;
 	}
@@ -332,7 +335,53 @@ async fn run(error_sender: Sender<anyhow::Error>) -> Result<()> {
 
 #[tokio::main]
 pub async fn main() -> Result<()> {
-	let (error_sender, mut error_receiver) = channel::<anyhow::Error>(1);
+	let (error_sender, mut error_receiver) = channel::<Report>(1);
+
+	// initialize color-eyre hooks
+	let (panic_hook, eyre_hook) = color_eyre::config::HookBuilder::default()
+		.panic_section(format!(
+			"This is bug. Please, consider reporting it to us at {}",
+			env!("CARGO_PKG_REPOSITORY")
+		))
+		.display_location_section(true)
+		.display_env_section(true)
+		.into_hooks();
+	// install hook as global handler
+	eyre_hook.install()?;
+
+	std::panic::set_hook(Box::new(move |panic_info| {
+		let msg = format!("{}", panic_hook.panic_report(panic_info));
+		#[cfg(not(debug_assertions))]
+		{
+			// prints color-eyre stack to stderr in production builds
+			eprintln!("{}", msg);
+			use human_panic::{handle_dump, print_msg, Metadata};
+			let meta = Metadata {
+				version: env!("CARGO_PKG_VERSION").into(),
+				name: env!("CARGO_PKG_NAME").into(),
+				authors: env!("CARGO_PKG_AUTHORS").into(),
+				homepage: env!("CARGO_PKG_HOMEPAGE").into(),
+			};
+
+			let file_path = handle_dump(&meta, panic_info);
+			// prints human-panic message
+			print_msg(file_path, &meta)
+				.expect("human-panic: printing error message to console failed");
+		}
+		error!("Error: {}", strip_ansi_escapes::strip_str(msg));
+
+		#[cfg(debug_assertions)]
+		{
+			// better-panic stacktrace that is only enabled when debugging
+			better_panic::Settings::auto()
+				.most_recent_first(false)
+				.lineno_suffix(true)
+				.verbosity(better_panic::Verbosity::Medium)
+				.create_panic_handler()(panic_info);
+		}
+
+		std::process::exit(libc::EXIT_FAILURE);
+	}));
 
 	if let Err(error) = run(error_sender).await {
 		error!("{error:#}");
@@ -341,7 +390,7 @@ pub async fn main() -> Result<()> {
 
 	let error = match error_receiver.recv().await {
 		Some(error) => error,
-		None => anyhow!("Failed to receive error message"),
+		None => eyre!("Failed to receive error message"),
 	};
 
 	// We are not logging error here since expectation is
